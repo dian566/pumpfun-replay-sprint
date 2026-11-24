@@ -1,12 +1,13 @@
 // Surge Scalper — a deterministic paper bot for the pump.fun replay sprint.
 //
-// Idea: most pump.fun curves bleed out, but a minority surge on real buy pressure
-// shortly after launch. This bot buys small into a confirmed surge (several
-// distinct buyers, net SOL flowing in, price climbing and holding near its
-// short-window high), then exits fast: a modest take-profit, a tight stop-loss,
+// Idea: most pump.fun curves bleed out, but a minority bounce hard after a
+// dip. The default mode buys small into a dip with buy flow returning
+// (price down 10-35% over the window, newer-half net flow positive and
+// improving), then exits fast: a modest take-profit, a very tight stop-loss,
 // a trailing stop once the trade is up, and a fade exit when the flow turns.
-// Positions are capped hard so no single coin can hurt the run, and tiny
-// probe round-trips keep the run above the competition's guardrail
+// A surge mode (buy confirmed breakouts instead) is kept behind the `dip`
+// flag. Positions are capped hard so no single coin can hurt the run, and
+// tiny probe round-trips keep the run above the competition's guardrail
 // (a round trip of at least 0.01 SOL on at least 20 coins) when the main
 // signal is quiet.
 //
@@ -81,42 +82,58 @@ export interface Params {
   probeSol: number;
   /** Most probe round trips open at once. */
   maxProbes: number;
+  /** When true, buy dips instead of surges: price down over the window with
+   * buy flow returning in the newer half (mean reversion). */
+  dip: boolean;
+  /** Dip entry: price fall over the window, minus 1 (e.g. -0.08 = down 8%). */
+  dipMinDown: number;
+  /** Dip entry: price must not have fallen more than this (avoid dead coins). */
+  dipMaxDown: number;
 }
 
+// The settings main.ts trades with. Chosen by sweeping 19 variants on the dev
+// window (see ENTRY-DRAFT.md): dip-buying with tight stops lost least among
+// genuine strategies (-0.14 SOL, 1.4% drawdown) while keeping tail upside
+// from bounce winners; surge-chasing and completion-riding lost far more on
+// this down-market window. Small size + tight stops cap the downside on a
+// bad final window; the dip entries keep a real shot at net PnL > 0.
 export const DEFAULT_PARAMS: Params = {
-  window: 50,
-  minNetSol: 0.4,
-  minBuys: 4,
-  minBuyers: 4,
-  minPriceUp: 0.06,
-  nearHigh: 0.95,
-  maxBuyerShare: 0.6,
-  minRqSol: 1,
-  maxRqSol: 50,
-  minAge: 100,
-  initialSol: 0.1,
-  addSol: 0.1,
-  maxPerPositionSol: 0.5,
+  window: 40,
+  minNetSol: 1,
+  minBuys: 6,
+  minBuyers: 6,
+  minPriceUp: 0.12,
+  nearHigh: 0.97,
+  maxBuyerShare: 0.5,
+  minRqSol: 2,
+  maxRqSol: 60,
+  minAge: 200,
+  initialSol: 0.03,
+  addSol: 0.03,
+  maxPerPositionSol: 0.12,
   minBuySol: 0.01,
   buySlipBps: 1500,
-  stopLoss: 0.15,
+  stopLoss: 0.05,
   takeProfit: 0.3,
-  trailArm: 0.12,
-  trail: 0.18,
-  fadeWindow: 25,
-  fadeNetSol: 0.25,
+  trailArm: 0.1,
+  trail: 0.15,
+  fadeWindow: 20,
+  fadeNetSol: 0.3,
   bigSellSol: 1.5,
-  maxHold: 1500,
+  maxHold: 800,
   holdIfUp: 0.1,
   cooldown: 150,
   maxEntries: 2,
   maxMain: 5,
-  maxExposureSol: 3,
+  maxExposureSol: 2,
   targetCoins: 25,
   targetFills: 200,
   paceSecs: 86400,
   probeSol: 0.012,
   maxProbes: 1,
+  dip: true,
+  dipMinDown: 0.1,
+  dipMaxDown: 0.35,
 };
 
 const LAMPORTS = 1e9;
@@ -199,11 +216,29 @@ export function createBot(p: Params = DEFAULT_PARAMS): Bot {
       last = tr.price;
     }
     if (buys < p.minBuys || byUser.size < p.minBuyers) return false;
-    if (buySol - sellSol < p.minNetSol) return false;
     if (startPrice <= 0 || last <= 0) return false;
     const up = last / startPrice - 1;
-    if (up < p.minPriceUp) return false;
-    if (last < high * p.nearHigh) return false;
+    if (p.dip) {
+      // Dip mode: price fell, but the newer half of the window shows buy
+      // flow returning (mean reversion, not a dead coin). Note: the
+      // whole-window net flow is usually negative in a dip, so it is NOT
+      // required here — only the newer half turning positive matters.
+      if (up > -p.dipMinDown || up < -p.dipMaxDown) return false;
+      let netOld = 0;
+      let netNew = 0;
+      const mid = now - p.window / 2;
+      for (const tr of t.trades) {
+        if (tr.slot <= from) continue;
+        const signed = tr.buy ? tr.sol : -tr.sol;
+        if (tr.slot <= mid) netOld += signed;
+        else netNew += signed;
+      }
+      if (netNew <= 0 || netNew < netOld) return false;
+    } else {
+      if (buySol - sellSol < p.minNetSol) return false;
+      if (up < p.minPriceUp) return false;
+      if (last < high * p.nearHigh) return false;
+    }
     let top = 0;
     for (const v of byUser.values()) if (v > top) top = v;
     if (top > p.maxBuyerShare * buySol) return false;
